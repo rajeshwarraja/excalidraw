@@ -124,6 +124,10 @@ export default defineConfig(({ mode }) => {
             if (id.includes("@codemirror/") || id.includes("@lezer/")) {
               return "codemirror.chunk";
             }
+
+            if (id.includes("openpgp")) {
+              return "openpgp.chunk";
+            }
           },
         },
       },

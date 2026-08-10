@@ -16,6 +16,7 @@ import {
 } from "@excalidraw/excalidraw/components/CommandPalette/CommandPalette";
 import { ErrorDialog } from "@excalidraw/excalidraw/components/ErrorDialog";
 import { OverwriteConfirmDialog } from "@excalidraw/excalidraw/components/OverwriteConfirm/OverwriteConfirm";
+import ConfirmDialog from "@excalidraw/excalidraw/components/ConfirmDialog";
 import { openConfirmModal } from "@excalidraw/excalidraw/components/OverwriteConfirm/OverwriteConfirmState";
 import { ShareableLinkDialog } from "@excalidraw/excalidraw/components/ShareableLinkDialog";
 import Trans from "@excalidraw/excalidraw/components/Trans";
@@ -31,10 +32,12 @@ import {
   resolvablePromise,
   isRunningInIframe,
   isDevEnv,
+  isDarwin,
 } from "@excalidraw/common";
 import polyfill from "@excalidraw/excalidraw/polyfill";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { loadFromBlob } from "@excalidraw/excalidraw/data/blob";
+import { fileOpen } from "@excalidraw/excalidraw/data/filesystem";
 import { t } from "@excalidraw/excalidraw/i18n";
 
 import {
@@ -47,7 +50,7 @@ import {
   share,
   youtubeIcon,
 } from "@excalidraw/excalidraw/components/icons";
-import { isElementLink } from "@excalidraw/element";
+import { isElementLink, hashElementsVersion } from "@excalidraw/element";
 import {
   bumpElementVersions,
   restoreAppState,
@@ -101,6 +104,23 @@ import Collab, {
 } from "./collab/Collab";
 import { AppFooter } from "./components/AppFooter";
 import { AppMainMenu } from "./components/AppMainMenu";
+import { LoadFromServerDialog } from "./components/LoadFromServerDialog";
+import { ResetCanvasConfirmDialog } from "./components/ResetCanvasConfirmDialog";
+import { SaveToServerNameDialog } from "./components/SaveToServerNameDialog";
+import {
+  loadSceneFromRestApi,
+  resetRestApiSession,
+  saveSceneToRestApi,
+} from "./data/restApi";
+import {
+  clearPendingRestApiAction,
+  setPendingRestApiAction,
+  takePendingRestApiAction,
+} from "./data/restApi/pendingAction";
+import {
+  exportKeypairAsJSON,
+  importKeypairFromJSON,
+} from "./data/restApi/keys";
 import { AppWelcomeScreen } from "./components/AppWelcomeScreen";
 import {
   ExportToExcalidrawPlus,
@@ -145,9 +165,6 @@ import { AIComponents } from "./components/AI";
 import { ExcalidrawPlusIframeExport } from "./ExcalidrawPlusIframeExport";
 
 import "./index.scss";
-
-import { ExcalidrawPlusPromoBanner } from "./components/ExcalidrawPlusPromoBanner";
-import { AppSidebar } from "./components/AppSidebar";
 
 import type { CollabAPI } from "./collab/Collab";
 
@@ -377,6 +394,73 @@ const ExcalidrawWrapper = () => {
 
   const [errorMessage, setErrorMessage] = useState("");
   const isCollabDisabled = isRunningInIframe();
+  const [isLoadFromServerOpen, setIsLoadFromServerOpen] = useState(false);
+  const [isSaveNameDialogOpen, setIsSaveNameDialogOpen] = useState(false);
+  const [isResetCanvasConfirmOpen, setIsResetCanvasConfirmOpen] =
+    useState(false);
+  const [pendingLoadObject, setPendingLoadObject] = useState<{
+    objectId: string;
+    name: string;
+  } | null>(null);
+  // holds the raw file contents while awaiting the user's confirmation to
+  // overwrite the current encryption keypair
+  const [pendingImportKeyJSON, setPendingImportKeyJSON] = useState<
+    string | null
+  >(null);
+  // becomes true once the initial scene (localStorage/collab/shared) has
+  // finished loading — used to gate resuming a save/load that was
+  // interrupted by an OIDC login redirect until the scene is ready.
+  const [isInitialSceneLoaded, setIsInitialSceneLoaded] = useState(false);
+  const hasResumedPendingRestApiActionRef = useRef(false);
+
+  // hash of scene elements as of the last successful save-to-server or
+  // load-from-server; `null` until that baseline is established (so we
+  // don't warn about "unsaved changes" before the user has ever saved or
+  // loaded anything). Persisted to localStorage so a page refresh doesn't
+  // forget genuinely unsaved changes and silently re-baseline as "clean".
+  const lastSyncedSceneHashRef = useRef<number | null>(
+    (() => {
+      const stored = localStorage.getItem(
+        STORAGE_KEYS.LOCAL_STORAGE_REST_API_SYNCED_HASH,
+      );
+      return stored === null ? null : Number(stored);
+    })(),
+  );
+  // whether a baseline was already persisted from a prior session — if so,
+  // the initial-load effect below must NOT clobber it with the (possibly
+  // edited-since-last-save) restored scene's hash.
+  const hadPersistedSyncedHashRef = useRef(
+    lastSyncedSceneHashRef.current !== null,
+  );
+
+  const setLastSyncedSceneHash = useCallback((hash: number | null) => {
+    lastSyncedSceneHashRef.current = hash;
+    try {
+      if (hash === null) {
+        localStorage.removeItem(
+          STORAGE_KEYS.LOCAL_STORAGE_REST_API_SYNCED_HASH,
+        );
+      } else {
+        localStorage.setItem(
+          STORAGE_KEYS.LOCAL_STORAGE_REST_API_SYNCED_HASH,
+          String(hash),
+        );
+      }
+    } catch {
+      // localStorage may be unavailable (e.g. private browsing); the
+      // baseline just won't survive a reload in that case.
+    }
+  }, []);
+
+  const hasUnsavedServerChanges = useCallback(() => {
+    if (!excalidrawAPI || lastSyncedSceneHashRef.current === null) {
+      return false;
+    }
+    return (
+      hashElementsVersion(excalidrawAPI.getSceneElementsIncludingDeleted()) !==
+      lastSyncedSceneHashRef.current
+    );
+  }, [excalidrawAPI]);
 
   const { editorTheme, appTheme, setAppTheme } = useHandleAppTheme();
 
@@ -565,6 +649,18 @@ const ExcalidrawWrapper = () => {
     initializeScene({ collabAPI, excalidrawAPI }).then(async (data) => {
       loadImages(data, /* isInitialLoad */ true);
       initialStatePromiseRef.current.promise.resolve(data.scene);
+      // baseline for "unsaved changes" tracking: whatever got restored on
+      // load (blank canvas, localStorage, or a shared/collab scene) counts
+      // as the known state until the user saves/loads to/from the server —
+      // but only if we don't already have a persisted baseline from a
+      // previous session (otherwise a refresh would silently discard a
+      // legitimate "unsaved changes" signal).
+      if (!hadPersistedSyncedHashRef.current) {
+        setLastSyncedSceneHash(
+          hashElementsVersion(excalidrawAPI.getSceneElementsIncludingDeleted()),
+        );
+      }
+      setIsInitialSceneLoaded(true);
     });
 
     const onHashChange = async (event: HashChangeEvent) => {
@@ -685,7 +781,14 @@ const ExcalidrawWrapper = () => {
         false,
       );
     };
-  }, [isCollabDisabled, collabAPI, excalidrawAPI, setLangCode, loadImages]);
+  }, [
+    isCollabDisabled,
+    collabAPI,
+    excalidrawAPI,
+    setLangCode,
+    loadImages,
+    setLastSyncedSceneHash,
+  ]);
 
   useEffect(() => {
     const unloadHandler = (event: BeforeUnloadEvent) => {
@@ -825,10 +928,231 @@ const ExcalidrawWrapper = () => {
 
   const localStorageQuotaExceeded = useAtomValue(localStorageQuotaExceededAtom);
 
+  const performLoadFromServer = useCallback(
+    async (objectId: string, name: string) => {
+      if (!excalidrawAPI) {
+        return;
+      }
+      // stashed so a mid-flight OIDC login redirect (triggered by
+      // getAccessToken() inside loadSceneFromRestApi) can resume this load
+      // automatically once the user is back and re-authenticated
+      setPendingRestApiAction({ type: "load", objectId, name });
+      try {
+        const data = await loadSceneFromRestApi(
+          objectId,
+          excalidrawAPI.getAppState(),
+          excalidrawAPI.getSceneElements(),
+        );
+        excalidrawAPI.updateScene({
+          elements: data.elements ?? [],
+          // the scene name isn't part of the serialized/encrypted
+          // payload (appState.name is export:false), so restore it
+          // from the object's server-side metadata instead
+          appState: { ...data.appState, name },
+          captureUpdate: CaptureUpdateAction.IMMEDIATELY,
+        });
+        if (data.files) {
+          excalidrawAPI.addFiles(Object.values(data.files));
+        }
+        setLastSyncedSceneHash(
+          hashElementsVersion(excalidrawAPI.getSceneElementsIncludingDeleted()),
+        );
+        setIsLoadFromServerOpen(false);
+        setPendingLoadObject(null);
+        excalidrawAPI.setToast({
+          message: `Loaded "${name}" from server`,
+          duration: 1500,
+        });
+      } catch (error: any) {
+        console.error(error);
+        excalidrawAPI.setToast({
+          message: `Failed to load "${name}" from server`,
+        });
+      } finally {
+        clearPendingRestApiAction();
+      }
+    },
+    [excalidrawAPI, setLastSyncedSceneHash],
+  );
+
   const onCollabDialogOpen = useCallback(
     () => setShareDialogState({ isOpen: true, type: "collaborationOnly" }),
     [setShareDialogState],
   );
+
+  const onExportEncryptionKey = useCallback(async () => {
+    try {
+      const json = await exportKeypairAsJSON();
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "excalidraw-encryption-key.json";
+      link.click();
+      URL.revokeObjectURL(url);
+      excalidrawAPI?.setToast({
+        message: "Encryption key exported. Keep this file private.",
+        duration: 3000,
+      });
+    } catch (error: any) {
+      console.error(error);
+      excalidrawAPI?.setToast({ message: "Failed to export encryption key" });
+    }
+  }, [excalidrawAPI]);
+
+  const onImportEncryptionKeyFile = useCallback(async () => {
+    try {
+      const file = await fileOpen({
+        description: "Excalidraw encryption key",
+        extensions: ["json"],
+      });
+      const json = await file.text();
+      setPendingImportKeyJSON(json);
+    } catch (error: any) {
+      // user cancelled the file picker
+      if (error?.name === "AbortError") {
+        return;
+      }
+      console.error(error);
+      excalidrawAPI?.setToast({
+        message: "Failed to read encryption key file",
+      });
+    }
+  }, [excalidrawAPI]);
+
+  const performImportEncryptionKey = useCallback(
+    async (json: string) => {
+      try {
+        await importKeypairFromJSON(json);
+        setPendingImportKeyJSON(null);
+        excalidrawAPI?.setToast({
+          message: "Encryption key imported",
+          duration: 3000,
+        });
+      } catch (error: any) {
+        console.error(error);
+        setPendingImportKeyJSON(null);
+        excalidrawAPI?.setToast({
+          message: error?.message ?? "Failed to import encryption key",
+        });
+      }
+    },
+    [excalidrawAPI],
+  );
+
+  const performSaveToServer = useCallback(
+    async (name: string) => {
+      if (!excalidrawAPI) {
+        return;
+      }
+      const appState = excalidrawAPI.getAppState();
+      // stashed so a mid-flight OIDC login redirect (triggered by
+      // getAccessToken() inside saveSceneToRestApi) can resume this save
+      // automatically once the user is back and re-authenticated
+      setPendingRestApiAction({ type: "save", name });
+      try {
+        await saveSceneToRestApi(
+          excalidrawAPI.getSceneElements(),
+          appState,
+          excalidrawAPI.getFiles(),
+          name,
+        );
+        setLastSyncedSceneHash(
+          hashElementsVersion(excalidrawAPI.getSceneElementsIncludingDeleted()),
+        );
+        excalidrawAPI.setToast({
+          message: `Saved "${name}" to server`,
+          duration: 1500,
+        });
+      } catch (error: any) {
+        console.error(error);
+        excalidrawAPI.setToast({
+          message: `Failed to save "${name}" to server`,
+        });
+      } finally {
+        clearPendingRestApiAction();
+      }
+    },
+    [excalidrawAPI, setLastSyncedSceneHash],
+  );
+
+  // Resumes a save/load that was interrupted by an OIDC login redirect
+  // (see `pendingAction.ts`/`auth.ts`'s `beginLogin`) once we're back and
+  // the initial scene has finished loading. Runs at most once per page
+  // load — if there's nothing stashed, this is a cheap no-op.
+  useEffect(() => {
+    if (
+      !excalidrawAPI ||
+      !isInitialSceneLoaded ||
+      hasResumedPendingRestApiActionRef.current
+    ) {
+      return;
+    }
+    hasResumedPendingRestApiActionRef.current = true;
+
+    const pending = takePendingRestApiAction();
+    if (!pending) {
+      return;
+    }
+    if (pending.type === "save") {
+      performSaveToServer(pending.name);
+    } else if (pending.type === "load") {
+      performLoadFromServer(pending.objectId, pending.name);
+    } else {
+      setIsLoadFromServerOpen(true);
+    }
+  }, [
+    excalidrawAPI,
+    isInitialSceneLoaded,
+    performSaveToServer,
+    performLoadFromServer,
+  ]);
+
+  const onSaveToServer = useCallback(() => {
+    const name = excalidrawAPI?.getAppState().name;
+    if (name) {
+      if (!hasUnsavedServerChanges()) {
+        excalidrawAPI?.setToast({
+          message: `"${name}" is already saved to server`,
+          duration: 1500,
+        });
+        return;
+      }
+      performSaveToServer(name);
+    } else {
+      // no name means this is logically a "new" scene (e.g. after
+      // "Reset the canvas") — forget any previously-saved object so this
+      // creates a brand new one instead of a new version of a stale one
+      resetRestApiSession();
+      setIsSaveNameDialogOpen(true);
+    }
+  }, [excalidrawAPI, performSaveToServer, hasUnsavedServerChanges]);
+
+  const onLoadFromServerOpen = useCallback(() => {
+    setIsLoadFromServerOpen(true);
+  }, []);
+
+  // Ctrl/Cmd+O ("Open") and Ctrl/Cmd+S ("Save to...") shortcuts for our
+  // REST-backed menu items — the native loadScene/saveToActiveFile actions
+  // (and their default Ctrl+O/Ctrl+S bindings) are disabled via
+  // `UIOptions.canvasActions` below, so these don't conflict.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const ctrlOrCmd = isDarwin ? event.metaKey : event.ctrlKey;
+      if (!ctrlOrCmd || event.shiftKey || event.altKey) {
+        return;
+      }
+      if (event.key.toLowerCase() === "o") {
+        event.preventDefault();
+        onLoadFromServerOpen();
+      } else if (event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        onSaveToServer();
+      }
+    };
+    window.addEventListener(EVENT.KEYDOWN, handleKeyDown);
+    return () => window.removeEventListener(EVENT.KEYDOWN, handleKeyDown);
+  }, [onLoadFromServerOpen, onSaveToServer]);
 
   // ---------------------------------------------------------------------------
   // onExport — intercepts file save to wait for pending image loads
@@ -956,6 +1280,12 @@ const ExcalidrawWrapper = () => {
         UIOptions={{
           canvasActions: {
             toggleTheme: true,
+            // disabled so Ctrl/Cmd+O and Ctrl/Cmd+S aren't intercepted by
+            // the native load-from-file/save-to-active-file actions —
+            // those shortcuts now open our REST-backed "Open"/"Save to..."
+            // instead (see the keydown handler above)
+            loadScene: false,
+            saveToActiveFile: false,
             export: {
               onExportToBackend,
               renderCustomUI: excalidrawAPI
@@ -999,12 +1329,6 @@ const ExcalidrawWrapper = () => {
 
           return (
             <div className="excalidraw-ui-top-right">
-              {excalidrawAPI?.getEditorInterface().formFactor === "desktop" && (
-                <ExcalidrawPlusPromoBanner
-                  isSignedIn={isExcalidrawPlusSignedUser}
-                />
-              )}
-
               {collabError.message && <CollabError collabError={collabError} />}
               <LiveCollaborationTrigger
                 isCollaborating={isCollaborating}
@@ -1033,7 +1357,88 @@ const ExcalidrawWrapper = () => {
           isCollabEnabled={!isCollabDisabled}
           theme={appTheme}
           refresh={() => forceRefresh((prev) => !prev)}
+          excalidrawAPI={excalidrawAPI}
+          onSaveToServer={onSaveToServer}
+          onLoadFromServerOpen={onLoadFromServerOpen}
+          onResetCanvasOpen={() => setIsResetCanvasConfirmOpen(true)}
+          onExportEncryptionKey={onExportEncryptionKey}
+          onImportEncryptionKeyFile={onImportEncryptionKeyFile}
         />
+        {pendingImportKeyJSON && (
+          <ConfirmDialog
+            title="Replace encryption key?"
+            confirmText="Replace key"
+            onConfirm={() => performImportEncryptionKey(pendingImportKeyJSON)}
+            onCancel={() => setPendingImportKeyJSON(null)}
+          >
+            <p>
+              This will replace your current encryption key. Any scenes saved to
+              the server under a different key will no longer be decryptable
+              unless you re-import that key later. Continue?
+            </p>
+          </ConfirmDialog>
+        )}
+        {isResetCanvasConfirmOpen && (
+          <ResetCanvasConfirmDialog
+            excalidrawAPI={excalidrawAPI}
+            hasUnsavedChanges={hasUnsavedServerChanges()}
+            onClose={() => setIsResetCanvasConfirmOpen(false)}
+            onReset={() => {
+              setLastSyncedSceneHash(
+                excalidrawAPI
+                  ? hashElementsVersion(
+                      excalidrawAPI.getSceneElementsIncludingDeleted(),
+                    )
+                  : null,
+              );
+            }}
+          />
+        )}
+        {isSaveNameDialogOpen && (
+          <SaveToServerNameDialog
+            onClose={() => setIsSaveNameDialogOpen(false)}
+            onConfirm={(name) => {
+              setIsSaveNameDialogOpen(false);
+              // persist the chosen name onto the scene so future saves in
+              // this session don't prompt again
+              excalidrawAPI?.updateScene({
+                appState: { name },
+                captureUpdate: CaptureUpdateAction.NEVER,
+              });
+              performSaveToServer(name);
+            }}
+          />
+        )}
+        {isLoadFromServerOpen && (
+          <LoadFromServerDialog
+            onClose={() => setIsLoadFromServerOpen(false)}
+            onSelect={(objectId, name) => {
+              if (hasUnsavedServerChanges()) {
+                setPendingLoadObject({ objectId, name });
+              } else {
+                performLoadFromServer(objectId, name);
+              }
+            }}
+          />
+        )}
+        {pendingLoadObject && (
+          <ConfirmDialog
+            title="Discard unsaved changes?"
+            confirmText="Discard and load"
+            onConfirm={() =>
+              performLoadFromServer(
+                pendingLoadObject.objectId,
+                pendingLoadObject.name,
+              )
+            }
+            onCancel={() => setPendingLoadObject(null)}
+          >
+            <p>
+              You have unsaved changes that will be lost if you load a different
+              scene from the server. Continue?
+            </p>
+          </ConfirmDialog>
+        )}
         <AppWelcomeScreen
           onCollabDialogOpen={onCollabDialogOpen}
           isCollabEnabled={!isCollabDisabled}
@@ -1099,8 +1504,6 @@ const ExcalidrawWrapper = () => {
             }
           }}
         />
-
-        <AppSidebar />
 
         {errorMessage && (
           <ErrorDialog onClose={() => setErrorMessage("")}>

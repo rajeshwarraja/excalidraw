@@ -1,17 +1,21 @@
 import {
-  loginIcon,
-  ExcalLogo,
   eyeIcon,
+  saveAs as saveIcon,
+  LoadIcon,
+  TrashIcon,
+  downloadIcon,
+  stackPushIcon,
 } from "@excalidraw/excalidraw/components/icons";
 import { MainMenu } from "@excalidraw/excalidraw/index";
+import { getShortcutFromShortcutName } from "@excalidraw/excalidraw/actions/shortcuts";
 import React from "react";
 
 import { isDevEnv } from "@excalidraw/common";
 
 import type { Theme } from "@excalidraw/element/types";
+import type { ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
 
 import { LanguageList } from "../app-language/LanguageList";
-import { isExcalidrawPlusSignedUser } from "../app_constants";
 
 import { saveDebugState } from "./DebugCanvas";
 
@@ -21,12 +25,29 @@ export const AppMainMenu: React.FC<{
   isCollabEnabled: boolean;
   theme: Theme | "system";
   refresh: () => void;
+  excalidrawAPI: ExcalidrawImperativeAPI | null;
+  onSaveToServer: () => void;
+  onLoadFromServerOpen: () => void;
+  onResetCanvasOpen: () => void;
+  onExportEncryptionKey: () => void;
+  onImportEncryptionKeyFile: () => void;
 }> = React.memo((props) => {
   return (
     <MainMenu>
-      <MainMenu.DefaultItems.LoadScene />
-      <MainMenu.DefaultItems.SaveToActiveFile />
-      <MainMenu.DefaultItems.Export />
+      <MainMenu.Item
+        icon={LoadIcon}
+        onSelect={props.onLoadFromServerOpen}
+        shortcut={getShortcutFromShortcutName("loadScene")}
+      >
+        Open
+      </MainMenu.Item>
+      <MainMenu.Item
+        icon={saveIcon}
+        onSelect={props.onSaveToServer}
+        shortcut={getShortcutFromShortcutName("saveScene")}
+      >
+        Save to...
+      </MainMenu.Item>
       <MainMenu.DefaultItems.SaveAsImage />
       {props.isCollabEnabled && (
         <MainMenu.DefaultItems.LiveCollaborationTrigger
@@ -37,27 +58,18 @@ export const AppMainMenu: React.FC<{
       <MainMenu.DefaultItems.CommandPalette className="highlighted" />
       <MainMenu.DefaultItems.SearchMenu />
       <MainMenu.DefaultItems.Help />
-      <MainMenu.DefaultItems.ClearCanvas />
-      <MainMenu.Separator />
-      <MainMenu.ItemLink
-        icon={ExcalLogo}
-        href={`${
-          import.meta.env.VITE_APP_PLUS_LP
-        }/plus?utm_source=excalidraw&utm_medium=app&utm_content=hamburger`}
-        className=""
+      <MainMenu.Item icon={TrashIcon} onSelect={props.onResetCanvasOpen}>
+        Reset the canvas
+      </MainMenu.Item>
+      <MainMenu.Item icon={downloadIcon} onSelect={props.onExportEncryptionKey}>
+        Export encryption key
+      </MainMenu.Item>
+      <MainMenu.Item
+        icon={stackPushIcon}
+        onSelect={props.onImportEncryptionKeyFile}
       >
-        Excalidraw+
-      </MainMenu.ItemLink>
-      <MainMenu.DefaultItems.Socials />
-      <MainMenu.ItemLink
-        icon={loginIcon}
-        href={`${import.meta.env.VITE_APP_PLUS_APP}${
-          isExcalidrawPlusSignedUser ? "" : "/sign-up"
-        }?utm_source=signin&utm_medium=app&utm_content=hamburger`}
-        className="highlighted"
-      >
-        {isExcalidrawPlusSignedUser ? "Sign in" : "Sign up"}
-      </MainMenu.ItemLink>
+        Import encryption key
+      </MainMenu.Item>
       {isDevEnv() && (
         <MainMenu.Item
           icon={eyeIcon}

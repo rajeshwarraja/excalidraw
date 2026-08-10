@@ -36,6 +36,24 @@ export const FIREBASE_STORAGE_PREFIXES = {
 
 export const ROOM_ID_BYTES = 10;
 
+// REST object storage — Authorization Code + PKCE auth against an OIDC
+// provider (e.g. Authentik). `AUTHORIZE_URL`/`TOKEN_URL` point at the
+// provider's `/application/o/authorize/` and `/application/o/token/`
+// endpoints; `CLIENT_ID` must be a "Public" client configured with those
+// same redirect URI(s) in the provider.
+export const REST_API = {
+  AUTHORIZE_URL:
+    import.meta.env.VITE_APP_REST_AUTHORIZE_URL ??
+    "http://localhost:9000/application/o/authorize/",
+  TOKEN_URL:
+    import.meta.env.VITE_APP_REST_TOKEN_URL ??
+    "http://localhost:9000/application/o/token/",
+  CLIENT_ID: import.meta.env.VITE_APP_REST_CLIENT_ID ?? "excalidraw",
+  SCOPE: import.meta.env.VITE_APP_REST_SCOPE ?? "openid profile email",
+  OBJECTS_BASE_URL:
+    import.meta.env.VITE_APP_REST_OBJECTS_URL ?? "http://localhost:8080",
+} as const;
+
 export const STORAGE_KEYS = {
   LOCAL_STORAGE_ELEMENTS: "excalidraw",
   LOCAL_STORAGE_APP_STATE: "excalidraw-state",
@@ -47,6 +65,12 @@ export const STORAGE_KEYS = {
 
   IDB_LIBRARY: "excalidraw-library",
   IDB_TTD_CHATS: "excalidraw-ttd-chats",
+  IDB_PGP_KEYPAIR: "excalidraw-rest-api-pgp-keypair",
+  LOCAL_STORAGE_REST_API_OBJECT_ID: "excalidraw-rest-api-object-id",
+  LOCAL_STORAGE_REST_API_SYNCED_HASH: "excalidraw-rest-api-synced-hash",
+  SESSION_STORAGE_REST_API_TOKENS: "excalidraw-rest-api-tokens",
+  SESSION_STORAGE_REST_API_PKCE: "excalidraw-rest-api-pkce",
+  SESSION_STORAGE_REST_API_PENDING_ACTION: "excalidraw-rest-api-pending-action",
 
   // do not use apart from migrations
   __LEGACY_LOCAL_STORAGE_LIBRARY: "excalidraw-library",
